@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-bridge",
+  "version": "1.0.0",
+  "description": "OpenClaw WebSocket bridge for RustDesk warmer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "pm2": "pm2 start server.js --name openclaw-bridge --restart-delay=3000"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
