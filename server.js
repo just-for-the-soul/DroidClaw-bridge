@@ -68,6 +68,56 @@ function sendWs(ws, obj) {
     }
 }
 
+// ── Command dispatch (shared by WS + HTTP orchestrators) ─────────────────────
+
+function resolveTarget(msg) {
+    let targetWs = null;
+    if (msg.device_id)  targetWs = deviceById.get(String(msg.device_id)) ?? null;
+    if (!targetWs && msg.stable_id) targetWs = deviceByStable.get(String(msg.stable_id)) ?? null;
+    // Single-device convenience: no explicit id → only connected device
+    if (!targetWs && !msg.device_id && !msg.stable_id && deviceById.size === 1) {
+        targetWs = deviceById.values().next().value;
+    }
+    return (targetWs && targetWs.writable) ? targetWs : null;
+}
+
+// Sends `command` to the device and resolves with the device's response
+// (or an error object on timeout). Same id-wrapping semantics as the WS path.
+function dispatchCommand(targetWs, command, timeoutMs = COMMAND_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+        const bridgeId = genId();
+        const outCmd = {
+            ...command,
+            id:      bridgeId,
+            view_id: command.id ?? command.view_id ?? "",
+        };
+        targetWs.send(JSON.stringify(outCmd));
+        log("ORCH", `→ device ${targetWs._deviceId} cmd=${command.type} tracking=${bridgeId}`);
+
+        const timer = setTimeout(() => {
+            if (pending.has(bridgeId)) {
+                pending.delete(bridgeId);
+                resolve({ id: bridgeId, error: "timeout", device_id: targetWs._deviceId });
+            }
+        }, timeoutMs);
+
+        pending.set(bridgeId, { timer, onResult: resolve });
+    });
+}
+
+function listDevices() {
+    const list = [];
+    for (const dws of deviceById.values()) {
+        list.push({
+            device_id:    dws._deviceId,
+            stable_id:    dws._stableId  ?? null,
+            device:       dws._deviceName,
+            connected_at: dws._connectedAt,
+        });
+    }
+    return list;
+}
+
 // ── WebSocket server (raw) ───────────────────────────────────────────────────
 // Minimal RFC-6455 implementation — no deps.
 
@@ -269,7 +319,7 @@ function handleDeviceSocket(ws, req) {
                 device_id: deviceId,
                 ...(msg.result ? { result: msg.result } : { error: msg.error }),
             };
-            sendWs(pendingCmd.orchestratorWs, resp);
+            pendingCmd.onResult(resp);
         }
     };
 
@@ -308,46 +358,16 @@ function handleOrchestratorSocket(ws) {
         }
 
         if (msg.type === "command" || msg.type === "ping") {
-            // Resolve target device
-            let targetWs = null;
-            if (msg.device_id)  targetWs = deviceById.get(msg.device_id)   ?? null;
-            if (!targetWs && msg.stable_id) targetWs = deviceByStable.get(msg.stable_id) ?? null;
-
-            if (!targetWs || !targetWs.writable) {
-                sendWs(ws, { error: "device not connected", device_id: msg.device_id ?? null });
-                return;
-            }
-
-            // For "ping" shorthand
-            const command = msg.type === "ping"
-                ? { type: "ping" }
-                : msg.command;
-
+            const command = msg.type === "ping" ? { type: "ping" } : msg.command;
             if (!command) {
                 sendWs(ws, { error: "missing 'command' field" }); return;
             }
-
-            // The bridge assigns its own tracking id. The original command id
-            // (if any) is preserved as view_id so the executor can use it.
-            const bridgeId  = genId();
-            const outCmd = {
-                ...command,
-                id:      bridgeId,
-                view_id: command.id ?? command.view_id ?? "",
-            };
-
-            targetWs.send(JSON.stringify(outCmd));
-            log("ORCH", `→ device ${targetWs._deviceId} cmd=${command.type} tracking=${bridgeId}`);
-
-            // Register pending callback
-            const timer = setTimeout(() => {
-                if (pending.has(bridgeId)) {
-                    pending.delete(bridgeId);
-                    sendWs(ws, { id: bridgeId, error: "timeout", device_id: targetWs._deviceId });
-                }
-            }, COMMAND_TIMEOUT_MS);
-
-            pending.set(bridgeId, { orchestratorWs: ws, timer });
+            const targetWs = resolveTarget(msg);
+            if (!targetWs) {
+                sendWs(ws, { error: "device not connected", device_id: msg.device_id ?? null });
+                return;
+            }
+            dispatchCommand(targetWs, command).then(resp => sendWs(ws, resp));
             return;
         }
 
@@ -385,18 +405,54 @@ deviceServer.listen(DEVICE_PORT, () => {
 
 // ── Orchestrator server (port 7335) ──────────────────────────────────────────
 
-const orchServer = http.createServer((req, res) => {
-    // Optional: simple HTTP status endpoint
+const orchServer = http.createServer(async (req, res) => {
+    const json = (code, obj) => {
+        res.writeHead(code, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(obj));
+    };
+
+    // ── GET /status ──
     if (req.method === "GET" && req.url === "/status") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-            devices:    deviceById.size,
-            pending:    pending.size,
-            uptime:     process.uptime(),
-        }));
+        return json(200, {
+            devices: deviceById.size,
+            pending: pending.size,
+            uptime:  process.uptime(),
+        });
+    }
+
+    // ── GET /devices ──
+    if (req.method === "GET" && req.url === "/devices") {
+        return json(200, { devices: listDevices() });
+    }
+
+    // ── POST /command ──
+    //   curl -s localhost:7335/command -d '{"device_id":"123","command":{"type":"ping"}}'
+    //   (device_id/stable_id optional when exactly one device is connected)
+    if (req.method === "POST" && req.url === "/command") {
+        let body = "";
+        req.on("data", c => {
+            body += c;
+            if (body.length > 1_000_000) { json(413, { error: "body too large" }); req.destroy(); }
+        });
+        req.on("end", async () => {
+            let msg;
+            try { msg = JSON.parse(body || "{}"); }
+            catch (e) { return json(400, { error: "invalid JSON: " + e.message }); }
+
+            const command = msg.command || (msg.type ? msg : null);   // allow bare command object
+            if (!command || !command.type) return json(400, { error: "missing 'command'" });
+
+            const targetWs = resolveTarget(msg);
+            if (!targetWs) return json(404, { error: "device not connected", device_id: msg.device_id ?? null });
+
+            const timeoutMs = msg.timeout > 0 ? Math.min(msg.timeout, 120_000) : COMMAND_TIMEOUT_MS;
+            const resp = await dispatchCommand(targetWs, command, timeoutMs);
+            return json(resp.error === "timeout" ? 504 : resp.error && !resp.result ? 502 : 200, resp);
+        });
         return;
     }
-    res.writeHead(200).end("OpenClaw Orchestrator\n");
+
+    res.writeHead(200).end("OpenClaw Orchestrator — POST /command, GET /devices, GET /status\n");
 });
 
 orchServer.on("upgrade", (req, socket, head) => {

@@ -68,6 +68,7 @@ function send(obj) {
  * scroll:       { type: "scroll", direction: "down", duration: 300 }
  * open_url:     { type: "open_url", url: "https://google.com" }
  * launch_app:   { type: "launch_app", package: "com.instagram.android" }
+ * list_packages:{ type: "list_packages", system: true, launchable_only: false }
  * back:         { type: "back" }
  * home:         { type: "home" }
  * notifications:{ type: "notifications" }
